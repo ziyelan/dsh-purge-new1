@@ -1,3 +1,8 @@
+import {
+  patchNotApplicable,
+  patchStateCategory,
+  summarizePatchRows,
+} from "../../../../lib/patch-state.mjs";
 // UI derived from YuJunZhiXue/dsh-purge 1.1.71 (MIT). See LICENSE.
 import { h, useEffect, useState } from "../shared/react.js";
 import { useT } from "../shared/locale.js";
@@ -31,7 +36,8 @@ export function statusLabel(st, t) {
   if (st === "drifted") return t("status.drifted");
   if (st === "disabled") return t("status.disabled");
   if (st === "skipped") return t("health.na");
-  if (st === "missing_file") return t("health.na");
+  if (st === "missing_file") return t("file.missing_file");
+  if (st === "unknown" || st === "unreadable") return t("file." + st);
   if (st === "unlocated") return t("status.unlocated");
   if (st === "na") return t("health.na");
   return st || t("unknown");
@@ -71,96 +77,94 @@ export function patchGroupOf(id) {
   return "normal";
 }
 
-/**
- * 逐补丁行。只认 `patch_rows`（服务端按 88 条补丁逐条给出）。
- * `state.patches` 是「显示分组」，一个分组聚合了多条补丁、只有一条 status，
- * 拿它当逐补丁列表会少算条目、也会把混合状态压成一个（1.7.18 修的就是这个）。
- */
-function rowsFromState(state) {
-  if (!state || !state.ai_base) return [];
-  const source = Array.isArray(state.patch_rows) ? state.patch_rows : null;
-  if (source) {
-    return source
-      .map((p) => ({
+// Only individual rows or a legacy per-ID map can support a patch count.
+export function patchEvidence(state) {
+  const empty = { kind: "unknown", rows: [], groups: [] };
+  if (!state?.ai_base || state.ok === false) return empty;
+  const validId = (id) =>
+    (typeof id === "number" || (typeof id === "string" && /^\d+$/.test(id))) &&
+    Number.isSafeInteger(Number(id)) &&
+    Number(id) >= 0;
+  const status = (st) => (typeof st === "string" && st ? st : "unknown");
+  const rows = Array.isArray(state.patch_rows) ? state.patch_rows : [];
+  const map = state.patch_status;
+  const source = rows.length
+    ? rows
+    : map && typeof map === "object" && !Array.isArray(map)
+      ? Object.entries(map).map(([id, st]) => ({
+          id,
+          status: st,
+          name: state.patch_names?.[id],
+        }))
+      : [];
+  if (
+    source.length &&
+    source.every((p) => validId(p?.id)) &&
+    new Set(source.map((p) => Number(p.id))).size === source.length
+  )
+    return {
+      kind: "detail",
+      groups: [],
+      rows: source.map((p) => ({
         id: Number(p.id),
-        st: p.status || "na",
+        st: status(p.status),
         layer: p.layer || "",
         name: p.name || "",
-      }))
-      .filter((r) => r.st && Number.isFinite(r.id));
-  }
-  const names = state.patch_names || {};
-  const statusMap = state.patch_status || {};
-  if (Object.keys(statusMap).length) {
-    return Object.keys(statusMap)
-      .map((id) => ({
-        id: Number(id),
-        st: statusMap[id],
-        layer: "",
-        name: names[id] || "",
-      }))
-      .filter((r) => r.st && Number.isFinite(r.id));
-  }
-  // 老载荷/夹具只剩分组表：只能按分组显示，明确标注为退化输入。
-  return (Array.isArray(state.patches) ? state.patches : [])
-    .map((p) => ({
-      id: Number(p.id),
-      st: p.status || "na",
-      layer: p.layer || "",
-      name: "",
-    }))
-    .filter((r) => r.st && Number.isFinite(r.id));
+        optional: p.optional === true,
+        settleWhenAbsent: p.settleWhenAbsent === true,
+      })),
+    };
+  const groups = Array.isArray(state.patches)
+    ? state.patches.filter(
+        (p) => p && typeof p === "object" && !Array.isArray(p),
+      )
+    : [];
+  return groups.length ? { kind: "summary", rows: [], groups } : empty;
+}
+
+export function patchRowsAll(state) {
+  return patchEvidence(state).rows;
 }
 
 export function patchRowsOf(state) {
-  return rowsFromState(state).filter((r) => r.st !== "na");
-}
-
-/** 含"本端不适用"的全量行：状态页要能单独把它们列出来，但不进分母。 */
-export function patchRowsAll(state) {
-  return rowsFromState(state);
+  return patchRowsAll(state).filter((r) => r.st !== "na");
 }
 
 function isNaRow(row) {
-  return row.st === "na" || row.st === "skipped" || row.st === "missing_file";
+  return (
+    row.st !== "disabled" && row.st !== "off" && patchNotApplicable(row, row.st)
+  );
 }
 
-/** 四态计数：已应用 / 待应用 / 未启用 / 本端不适用，后两者互斥且不计入分母。 */
 export function patchGroupCounts(rows) {
-  const out = { applied: 0, pending: 0, off: 0, na: 0, total: 0, denom: 0 };
-  for (const row of rows || []) {
-    out.total += 1;
-    if (isNaRow(row)) out.na += 1;
-    else if (row.st === "disabled") out.off += 1;
-    else if (row.st === "applied" || row.st === "already") out.applied += 1;
-    else out.pending += 1;
-  }
-  out.denom = out.total - out.na;
-  return out;
+  const counts = summarizePatchRows(rows);
+  return {
+    applied: counts.applied,
+    pending: counts.pending + counts.broken + counts.unknown,
+    off: counts.disabled + counts.off,
+    na: counts.not_applicable - counts.disabled - counts.off,
+    total: counts.all,
+    denom: counts.total,
+  };
 }
 
 export function tallyPatches(rows) {
-  const out = {
-    applied: 0,
-    pending: 0,
-    unmatched: 0,
-    partial: 0,
-    drifted: 0,
-    disabled: 0,
-    skipped: 0,
-    total: 0,
+  const counts = summarizePatchRows(rows);
+  return {
+    applied: counts.applied,
+    pending: counts.pending,
+    unmatched: counts.unmatched,
+    partial: counts.partial,
+    drifted: counts.drifted,
+    disabled: counts.disabled + counts.off,
+    skipped: counts.skipped,
+    unverified:
+      counts.unknown +
+      (rows || []).filter(
+        (row) => row.st === "missing_file" && !patchNotApplicable(row, row.st),
+      ).length,
+    total: counts.all,
   };
-  for (const row of rows || []) {
-    out.total += 1;
-    if (row.st === "applied" || row.st === "already") out.applied += 1;
-    else if (row.st === "pending") out.pending += 1;
-    else if (row.st === "unmatched") out.unmatched += 1;
-    else if (row.st === "partial") out.partial += 1;
-    else if (row.st === "drifted") out.drifted += 1;
-    else if (row.st === "disabled") out.disabled += 1;
-    else out.skipped += 1;
-  }
-  return out;
 }
 
 function Tile({ kind, label, value, title, text }) {
@@ -181,7 +185,10 @@ function Tile({ kind, label, value, title, text }) {
 export function PatchHealth({ state }) {
   const t = useT();
   if (!state || !state.ai_base) return null;
-  const counts = patchGroupCounts(patchRowsAll(state));
+  const evidence = patchEvidence(state);
+  if (evidence.kind !== "detail")
+    return h("p", { role: "status" }, t("evidence." + evidence.kind));
+  const counts = patchGroupCounts(evidence.rows);
   const denom = Math.max(counts.denom, 1);
   const pct = (n) => (n / denom) * 100;
   const verdict = counts.pending
@@ -314,8 +321,7 @@ export function PatchGroupSwitches({ state, onSaved }) {
       alive = false;
     };
   }, []);
-  const counts = patchGroupCounts(patchRowsAll(state));
-  const rows = patchRowsAll(state);
+  const { kind, rows } = patchEvidence(state);
   const permApplied = rows.filter(
     (r) => patchGroupOf(r.id) === "permission" && r.st === "applied",
   ).length;
@@ -364,13 +370,16 @@ export function PatchGroupSwitches({ state, onSaved }) {
         desc: t("sw.permission.desc"),
         hintTitle: t("sw.permission"),
         hint: t("sw.permission.hint"),
-        chip: permOn
-          ? t("sw.chip.on", {
-              n: PERMISSION_PATCH_IDS.length,
-              written: permApplied,
-              pending: permPending,
-            })
-          : t("sw.chip.off", { n: PERMISSION_PATCH_IDS.length }),
+        chip:
+          kind !== "detail"
+            ? t("evidence." + kind)
+            : permOn
+              ? t("sw.chip.on", {
+                  n: PERMISSION_PATCH_IDS.length,
+                  written: permApplied,
+                  pending: permPending,
+                })
+              : t("sw.chip.off", { n: PERMISSION_PATCH_IDS.length }),
         onToggle: () => toggle("permissionPatches"),
       }),
       h(Switch, {
@@ -380,13 +389,16 @@ export function PatchGroupSwitches({ state, onSaved }) {
         desc: t("sw.context.desc"),
         hintTitle: t("sw.context"),
         hint: t("sw.context.hint"),
-        chip: ctxOn
-          ? t("sw.chip.on", {
-              n: CONTEXT_PATCH_IDS.length,
-              written: ctxApplied,
-              pending: CONTEXT_PATCH_IDS.length - ctxApplied,
-            })
-          : t("sw.chip.off", { n: CONTEXT_PATCH_IDS.length }),
+        chip:
+          kind !== "detail"
+            ? t("evidence." + kind)
+            : ctxOn
+              ? t("sw.chip.on", {
+                  n: CONTEXT_PATCH_IDS.length,
+                  written: ctxApplied,
+                  pending: CONTEXT_PATCH_IDS.length - ctxApplied,
+                })
+              : t("sw.chip.off", { n: CONTEXT_PATCH_IDS.length }),
         onToggle: () => toggle("contextManagement"),
       }),
     ),
@@ -414,12 +426,52 @@ export function PatchGroups({ state }) {
   const [filter, setFilter] = useState("all");
   if (state?.ok === false)
     return h("p", { role: "status" }, t("groups.unreadable"));
-  if (!state || !state.patch_status)
+  if (!state)
     return h("div", { className: "dshpp-skel", style: { height: 120 } });
   const located = !!state.ai_base;
   if (!located) return null;
 
-  const allRows = patchRowsAll(state);
+  const { kind, rows: allRows, groups } = patchEvidence(state);
+  if (kind === "unknown")
+    return h("p", { role: "status" }, t("evidence.unknown"));
+  if (kind === "summary")
+    return h(
+      "ul",
+      { "aria-label": t("evidence.summary") },
+      groups.map((g, i) =>
+        h(
+          "li",
+          { key: i },
+          [
+            g.layer,
+            g.name,
+            Array.isArray(g.ids)
+              ? g.ids.map((id) => "#" + id).join("、")
+              : g.id != null
+                ? "#" + g.id
+                : "",
+          ]
+            .filter(Boolean)
+            .join(" · "),
+          "：",
+          statusLabel(typeof g.status === "string" ? g.status : "unknown", t),
+          Array.isArray(g.members) &&
+            h(
+              "ul",
+              null,
+              g.members
+                .filter((m) => m && typeof m.status === "string")
+                .map((m, j) =>
+                  h(
+                    "li",
+                    { key: j },
+                    "#" + m.id + "：" + statusLabel(m.status, t),
+                  ),
+                ),
+            ),
+        ),
+      ),
+    );
   const counts = patchGroupCounts(allRows);
   const filterCount = {
     all: counts.total,
@@ -429,13 +481,10 @@ export function PatchGroups({ state }) {
   };
   const kept = allRows.filter((row) => {
     if (filter === "pending")
-      return (
-        !isNaRow(row) &&
-        row.st !== "disabled" &&
-        row.st !== "applied" &&
-        row.st !== "already"
+      return ["pending", "unknown", "broken"].includes(
+        patchStateCategory(row, row.st),
       );
-    if (filter === "off") return row.st === "disabled";
+    if (filter === "off") return row.st === "disabled" || row.st === "off";
     if (filter === "na") return isNaRow(row);
     return true;
   });
@@ -482,6 +531,8 @@ export function PatchGroups({ state }) {
         notes.push(t("metric.unmatchedShort", { n: tally.unmatched }));
       if (tally.partial)
         notes.push(t("metric.partialShort", { n: tally.partial }));
+      if (tally.unverified)
+        notes.push(t("metric.unverifiedShort", { n: tally.unverified }));
       if (tally.drifted)
         notes.push(t("metric.driftedShort", { n: tally.drifted }));
       if (tally.disabled)
@@ -582,13 +633,39 @@ export function PatchGroups({ state }) {
                         : h(
                             "span",
                             { className: "dshpp-row-note" },
-                            t("hint." + (r.st || "unknown")),
+                            r.st === "missing_file" && !isNaRow(r)
+                              ? t("file.missing_file")
+                              : t("hint." + (r.st || "unknown")),
                           ),
                     ),
                     h(
                       "td",
                       null,
-                      h(Pill, { value: r.st }),
+                      r.st === "missing_file" && !isNaRow(r)
+                        ? h(Pill, {
+                            value: "unmatched",
+                            label: t("file.missing_file"),
+                          })
+                        : h(Pill, { value: r.st }),
+                      (r.id === 71 || !["applied", "already"].includes(r.st)) &&
+                        (state.patch_files?.[r.id] || []).map((file) =>
+                          h(
+                            "div",
+                            {
+                              key: file.path,
+                              className: "dshpp-row-note",
+                              style: { overflowWrap: "anywhere" },
+                            },
+                            (["missing_file", "unreadable", "unknown"].includes(
+                              file.status,
+                            )
+                              ? t("file." + file.status)
+                              : statusLabel(file.status, t)) +
+                              " · " +
+                              file.path,
+                          ),
+                        ),
+
                       r.st === "partial"
                         ? h(
                             "span",
